@@ -1,0 +1,106 @@
+name: Sign release
+
+run-name: Sign v${{ inputs.version }}
+
+# Dispatched by Hud's build pipeline after it uploads a draft release. Signing happens here, in this
+# public repo, so the identity customers verify against is this workflow:
+#   https://github.com/code-hud/java-sdk-releases/.github/workflows/sign.yml@refs/heads/main
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the leading v (e.g. 1.2.3)."
+        required: true
+        type: string
+      jar_sha256:
+        description: "SHA-256 of hud-sdk.jar as produced by the build. Nothing is signed unless the release JARs match it."
+        required: true
+        type: string
+      publish:
+        description: "Publish the release after signing. Leave unchecked to keep it as a draft."
+        required: false
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the release as a prerelease."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: sign-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+
+    steps:
+      - name: Download release assets
+        run: |
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir release \
+            --pattern "hud-sdk*.jar" --pattern "*.cdx.json"
+          ls -la release
+
+      - name: Check JARs match the build
+        working-directory: release
+        env:
+          EXPECTED_SHA256: ${{ inputs.jar_sha256 }}
+        run: |
+          if ! [[ "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: jar_sha256 is not a lowercase hex SHA-256 digest." >&2
+            exit 1
+          fi
+          for file in hud-sdk*.jar; do
+            echo "${EXPECTED_SHA256}  ${file}" | sha256sum -c -
+          done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign and write checksums
+        working-directory: release
+        run: |
+          shopt -s nullglob
+          assets=(hud-sdk*.jar *.cdx.json)
+          for file in "${assets[@]}"; do
+            cosign sign-blob --yes --bundle "${file}.sigstore.json" "${file}"
+          done
+          sha256sum "${assets[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload signatures and checksums
+        run: gh release upload "${TAG}" release/*.sigstore.json release/SHA256SUMS --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Add verification steps to release notes
+        run: |
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json body --jq .body > notes.md
+          if ! grep -q '^### Verify the download' notes.md; then
+            cat >> notes.md <<EOF
+
+          ### Verify the download
+
+          \`\`\`
+          sha256sum -c --ignore-missing SHA256SUMS
+          cosign verify-blob --bundle hud-sdk-${VERSION}.jar.sigstore.json \\
+            --certificate-identity 'https://github.com/code-hud/java-sdk-releases/.github/workflows/sign.yml@refs/heads/main' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+            hud-sdk-${VERSION}.jar
+          \`\`\`
+          EOF
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --notes-file notes.md
+          fi
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --prerelease="${PRERELEASE}"
